@@ -3,29 +3,64 @@
 #include <ArduinoHA.h>
 #include "user_settings.h"
 #include <Adafruit_ADS1X15.h>
-#include <SPI.h>
 
-#define uS_TO_S_FACTOR 1000000ULL // Conversion factor for micro seconds to seconds
+#define uS_TO_S_FACTOR 1000000ULL // microseconds per second
 
-// ADS1115 Analog Digital Wandler
+// RTC user memory survives deep sleep and is used to estimate the current time
+// without a WiFi/NTP round-trip on every wake-up.
+#define RTC_MAGIC  0xA5C3F1E7
+#define RTC_OFFSET 0  // word offset in the user RTC area
+
+struct RtcData {
+    uint32_t magic;
+    uint32_t utcEpoch;  // estimated UTC time at the next scheduled wake-up
+};
+
+bool loadRtcData(RtcData &data) {
+    ESP.rtcUserMemoryRead(RTC_OFFSET, (uint32_t *)&data, sizeof(data));
+    return data.magic == RTC_MAGIC;
+}
+
+void saveRtcData(uint32_t utcEpoch) {
+    RtcData data = { RTC_MAGIC, utcEpoch };
+    ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&data, sizeof(data));
+}
+
+// UTC+1 (CET) as a conservative Berlin estimate; at most 1 hour early during summer time
+bool isNightTime(uint32_t utcEpoch) {
+    int hour = (int)(((utcEpoch + 3600UL) / 3600UL) % 24UL);
+    return hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR;
+}
+
+uint32_t secondsUntilMorning(uint32_t utcEpoch) {
+    uint32_t local    = utcEpoch + 3600UL;
+    int secsToday     = (int)((local / 3600UL % 24UL) * 3600UL
+                            + (local / 60UL  % 60UL) * 60UL
+                            +  local % 60UL);
+    int target        = NIGHT_END_HOUR * 3600;
+    if (secsToday < target)
+        return (uint32_t)(target - secsToday);
+    return (uint32_t)(86400 - secsToday + target);
+}
+
+// ADS1115 analog-to-digital converter
 Adafruit_ADS1115 ads;
 
-void Sleep(uint secondsToSleep)
+void Sleep(uint32_t secondsToSleep)
 {
+	uint32_t maxSecs = (uint32_t)(ESP.deepSleepMax() / 1000000ULL);
+	uint32_t toSleep = secondsToSleep < maxSecs ? secondsToSleep : maxSecs;
+
 	WiFi.disconnect(true);
 	WiFi.mode(WIFI_OFF);
 
 	digitalWrite(D5, LOW);
 	pinMode(D5, INPUT);
 
-	Serial.print("Going to sleep for ");
-	float minutesToSleep = secondsToSleep / 60.0;
-	Serial.print(minutesToSleep);
-	Serial.println(" minutes.");
+	Serial.printf("Going to sleep for %.1f minutes.\n", toSleep / 60.0);
 	delay(1000);
 
-	uint64_t sleepTime = uS_TO_S_FACTOR * secondsToSleep;
-	ESP.deepSleep(sleepTime);
+	ESP.deepSleep((uint64_t)toSleep * uS_TO_S_FACTOR);
 }
 
 const bool connectToNetwork()
@@ -68,11 +103,7 @@ const String GetZuluTime()
 	gmtime_r(&now, &tm); // update the structure tm with the current time (in GMT)
 	char buf[25];
 	snprintf(buf, sizeof(buf), "20%02d-%02d-%02dT%02d:%02d:%02dZ", tm.tm_year - 100, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-	char *dt = new char[25];
-	strcpy(dt, buf);
-	String result = String(dt);
-
-	return result;
+	return String(buf);
 }
 
 char* concat(const char *str1, const char *str2)
@@ -144,40 +175,53 @@ void SenqMqtt(float battVolt, float battPercent, float percent1, float percent2,
 	sensorSoil1.setName(concat(deviceName, " Soil 1"));
 	sensorSoil1.setDeviceClass("moisture");
 	sensorSoil1.setForceUpdate(true);
+	sensorSoil1.setExpireAfter(43200);
+	sensorSoil1.setStateClass("measurement");
 
 	sensorSoil2.setUnitOfMeasurement("%");
 	sensorSoil2.setIcon("mdi:water-percent");
 	sensorSoil2.setName(concat(deviceName, " Soil 2"));
 	sensorSoil2.setDeviceClass("moisture");
 	sensorSoil2.setForceUpdate(true);
+	sensorSoil2.setExpireAfter(43200);
+	sensorSoil2.setStateClass("measurement");
 
 	sensorSoil3.setUnitOfMeasurement("%");
 	sensorSoil3.setIcon("mdi:water-percent");
 	sensorSoil3.setName(concat(deviceName, " Soil 3"));
 	sensorSoil3.setDeviceClass("moisture");
 	sensorSoil3.setForceUpdate(true);
+	sensorSoil3.setExpireAfter(43200);
+	sensorSoil3.setStateClass("measurement");
 
 	sensorSoil4.setUnitOfMeasurement("%");
 	sensorSoil4.setIcon("mdi:water-percent");
 	sensorSoil4.setName(concat(deviceName, " Soil 4"));
 	sensorSoil4.setDeviceClass("moisture");
 	sensorSoil4.setForceUpdate(true);
+	sensorSoil4.setExpireAfter(43200);
+	sensorSoil4.setStateClass("measurement");
 
 	sensorBatteryVoltage.setName(concat(deviceName, " Batt Voltage"));
 	sensorBatteryVoltage.setIcon("mdi:battery");
 	sensorBatteryVoltage.setUnitOfMeasurement("V");
 	sensorBatteryVoltage.setDeviceClass("voltage");
 	sensorBatteryVoltage.setForceUpdate(true);
+	sensorBatteryVoltage.setExpireAfter(43200);
+	sensorBatteryVoltage.setStateClass("measurement");
 
 	sensorBatteryPercent.setName(concat(deviceName, " Batt Percent"));
 	sensorBatteryPercent.setIcon("mdi:battery");
 	sensorBatteryPercent.setUnitOfMeasurement("%");
 	sensorBatteryPercent.setDeviceClass("battery");
 	sensorBatteryPercent.setForceUpdate(true);
+	sensorBatteryPercent.setExpireAfter(43200);
+	sensorBatteryPercent.setStateClass("measurement");
 
 	sensorTimestamp.setName(concat(deviceName, " Updated"));
 	sensorTimestamp.setIcon("mdi:update");
 	sensorTimestamp.setDeviceClass("timestamp");
+	sensorTimestamp.setExpireAfter(43200);
 
 	String dateTime = GetZuluTime();
 	Serial.print("Datetime: ");
@@ -235,9 +279,9 @@ float GetBatteryPercent(float currentVoltage, float minimumVoltage, float maximu
 	return relativeStateOfCharge;
 }
 
-float GetPercent(int port, float value, int air, int water)
+float GetPercent(float value, int air, int water)
 {
-	float percent = map(value, air, water, 0, 100);
+	float percent = map(value, air, water, 0, 100); // integer map intentional: sensor resolution does not warrant float precision
 	if (!doCalibration && percent > 100)
 		percent = 100;
 	if (!doCalibration && percent < 0)
@@ -248,7 +292,7 @@ float GetPercent(int port, float value, int air, int water)
 
 void WriteCalibrationData(int port, float value, float min, float max, int air, int water)
 {
-	float percent = GetPercent(port, value, air, water);
+	float percent = GetPercent(value, air, water);
 
 	Serial.print("Analog");
 	Serial.print(port);
@@ -309,10 +353,10 @@ int updateSensor()
 	if (doCalibration)
 		return 0;
 
-	percent0 = GetPercent(0, min0, air0, water0);
-	percent1 = GetPercent(1, min1, air1, water1);
-	percent2 = GetPercent(2, min2, air2, water2);
-	percent3 = GetPercent(3, min3, air3, water3);
+	percent0 = GetPercent(min0, air0, water0);
+	percent1 = GetPercent(min1, air1, water1);
+	percent2 = GetPercent(min2, air2, water2);
+	percent3 = GetPercent(min3, air3, water3);
 	Serial.println();
 	
 	Serial.println("Reading Battery...");
@@ -340,7 +384,21 @@ void setup()
 {
 	Serial.begin(115200);
 	Serial.println();
-	Serial.println("Starting... ");
+	Serial.println("Starting...");
+
+	// Early night check from RTC memory - no WiFi or sensor init needed
+	RtcData rtc;
+	if (!doCalibration && loadRtcData(rtc) && isNightTime(rtc.utcEpoch)) {
+		uint32_t maxSecs = (uint32_t)(ESP.deepSleepMax() / 1000000ULL);
+		uint32_t toSleep = secondsUntilMorning(rtc.utcEpoch);
+		if (toSleep > maxSecs) toSleep = maxSecs;
+		Serial.printf("Night time (%02dh local) - sleeping %us\n",
+		              (int)(((rtc.utcEpoch + 3600UL) / 3600UL) % 24UL), toSleep);
+		saveRtcData(rtc.utcEpoch + toSleep);
+		delay(100);
+		ESP.deepSleep((uint64_t)toSleep * uS_TO_S_FACTOR);
+		return;
+	}
 
 	// ADS and SOIL sensors powered via D5
 	pinMode(D5, OUTPUT);
@@ -355,7 +413,6 @@ void setup()
 	else if (doCalibration)
 		delay(2000); // required for ADS to come up
 
-	
 	ads.setGain(GAIN_ONE); // set to +- 4096 mV
 	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");
 	if (!ads.begin())
@@ -366,6 +423,11 @@ void setup()
 	}
 
 	configTime(MY_TZ, MY_NTP_SERVER);
+
+	// Wait for NTP sync (max 10s)
+	time_t now = 0;
+	for (int i = 0; i < 20 && now < 1000000; i++) { delay(500); time(&now); }
+
 	Serial.println("Initialized.");
 	Serial.println();
 
@@ -373,10 +435,9 @@ void setup()
 
 	digitalWrite(D5, LOW);
 
-	if (battPercent > 80)
-		Sleep(TIME_TO_SLEEP);
-	else
-		Sleep(TIME_TO_SLEEP_LONG);
+	uint32_t sleepSecs = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
+	saveRtcData((uint32_t)time(nullptr) + sleepSecs);
+	Sleep(sleepSecs);
 }
 
 void loop()

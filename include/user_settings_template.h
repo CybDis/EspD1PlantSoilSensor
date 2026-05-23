@@ -8,12 +8,11 @@
 #define MY_NTP_SERVER "pool.ntp.org"
 #define MY_TZ "CET-1CEST,M3.5.0/02,M10.5.0/03"
 
-// Off-sets for time, and summertime. each hour is 3.600 seconds.
-const long  gmtOffset_sec = 3600;    // Europa/Berlin
-
-#define uS_TO_S_FACTOR 1000000ULL   //Conversion factor for micro seconds to seconds
-#define TIME_TO_SLEEP_LONG  10800   // 180 min = 3h 
+#define TIME_TO_SLEEP_LONG  10800   // 180 min = 3h
 #define TIME_TO_SLEEP  3600         // 60 min = 1h
+
+#define NIGHT_START_HOUR    22      // no updates at or after this local hour (CET)
+#define NIGHT_END_HOUR       6      // resume updates at this local hour (CET)
 
 // Device name, to appear on WiFi and as MQTT/HA device name
 const char* deviceName    = "EspSensorSolar2";
