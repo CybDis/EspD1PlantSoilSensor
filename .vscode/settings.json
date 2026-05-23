@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "chrono": "cpp"
+    },
+    // "search.exclude": {
+    //     "**/.pio": true,
+    //     "**/.vs": true,
+    //     "**/.vscode": true,
+    // }
+}
