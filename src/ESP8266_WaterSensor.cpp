@@ -386,9 +386,13 @@ void setup()
 	Serial.println();
 	Serial.println("Starting...");
 
-	// Early night check from RTC memory - no WiFi or sensor init needed
+	// Early night check from RTC memory - only valid after a deep sleep wake-up.
+	// On manual reset the RTC epoch is stale and must not be used for time decisions.
 	RtcData rtc;
-	if (!doCalibration && loadRtcData(rtc) && isNightTime(rtc.utcEpoch)) {
+	if (!doCalibration
+	    && ESP.getResetReason() == "Deep-Sleep Wake"
+	    && loadRtcData(rtc)
+	    && isNightTime(rtc.utcEpoch)) {
 		uint32_t maxSecs = (uint32_t)(ESP.deepSleepMax() / 1000000ULL);
 		uint32_t toSleep = secondsUntilMorning(rtc.utcEpoch);
 		if (toSleep > maxSecs) toSleep = maxSecs;
