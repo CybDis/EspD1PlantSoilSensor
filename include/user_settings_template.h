@@ -11,10 +11,6 @@
 #define TIME_TO_SLEEP_LONG  10800   // 180 min = 3h
 #define TIME_TO_SLEEP  3600         // 60 min = 1h
 
-#define NTP_RETRIES           3     // number of full NTP attempts before giving up
-#define NTP_POLLS_PER_ATTEMPT 10    // polls per attempt (x NTP_WAIT_MS = max wait per attempt)
-#define NTP_WAIT_MS         500     // ms between polls
-
 #define NIGHT_START_HOUR    22      // no updates at or after this local hour (CET)
 #define NIGHT_END_HOUR       6      // resume updates at this local hour (CET)
 
