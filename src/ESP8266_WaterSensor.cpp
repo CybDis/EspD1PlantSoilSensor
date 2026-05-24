@@ -6,6 +6,7 @@
 
 #define uS_TO_S_FACTOR 1000000ULL // microseconds per second
 #define MAX_SLEEP_SECS        3600 // ESP8266 hardware cap; do not raise above ~3600 s
+#define MIN_VALID_UTC 1600000000UL // 2020-09-13; rejects NTP-fail epochs (~0) and bogus RTC data
 #define NTP_RETRIES              3 // full NTP attempts before giving up
 #define NTP_POLLS_PER_ATTEMPT   10 // polls per attempt
 #define NTP_WAIT_MS            500 // ms between polls
@@ -398,13 +399,23 @@ void setup()
 {
 	Serial.begin(115200);
 	Serial.println();
-	Serial.println("Starting...");
+	Serial.printf("Starting... (reset reason: %s)\n", ESP.getResetReason().c_str());
 
-	// RTC checks are only valid after a deep sleep wake-up; on manual reset the data is stale.
+	// validWake requires: deep-sleep wake reason, valid RTC magic, and a plausible epoch.
+	// The epoch check rejects data written after an NTP failure (~epoch 0) and guards against
+	// boards where an RTS reset mis-reports as "Deep-Sleep Wake".
 	RtcData rtc;
+	bool rtcValid = loadRtcData(rtc);
 	bool validWake = !doCalibration
 	                 && ESP.getResetReason() == "Deep-Sleep Wake"
-	                 && loadRtcData(rtc);
+	                 && rtcValid
+	                 && rtc.utcEpoch >= MIN_VALID_UTC;
+
+	Serial.printf("RTC: magic=%s epoch=%lu nextMeasure=%lu -> validWake=%d\n",
+	              rtcValid ? "ok" : "bad",
+	              rtcValid ? (unsigned long)rtc.utcEpoch : 0UL,
+	              rtcValid ? (unsigned long)rtc.nextMeasure : 0UL,
+	              validWake);
 
 	if (validWake && isNightTime(rtc.utcEpoch)) {
 		uint32_t toSleep = secondsUntilMorning(rtc.utcEpoch);
