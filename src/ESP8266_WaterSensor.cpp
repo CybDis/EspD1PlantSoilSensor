@@ -8,12 +8,13 @@
 
 // RTC user memory survives deep sleep and is used to estimate the current time
 // without a WiFi/NTP round-trip on every wake-up.
-#define RTC_MAGIC  0xA5C3F1E7
+#define RTC_MAGIC  0xA5C3F1E9  // increment when RtcData layout changes
 #define RTC_OFFSET 0  // word offset in the user RTC area
 
 struct RtcData {
     uint32_t magic;
-    uint32_t utcEpoch;  // estimated UTC time at the next scheduled wake-up
+    uint32_t utcEpoch;    // estimated UTC time at the next scheduled wake-up
+    uint32_t nextMeasure; // UTC time of the next scheduled measurement
 };
 
 bool loadRtcData(RtcData &data) {
@@ -21,8 +22,8 @@ bool loadRtcData(RtcData &data) {
     return data.magic == RTC_MAGIC;
 }
 
-void saveRtcData(uint32_t utcEpoch) {
-    RtcData data = { RTC_MAGIC, utcEpoch };
+void saveRtcData(uint32_t utcEpoch, uint32_t nextMeasure) {
+    RtcData data = { RTC_MAGIC, utcEpoch, nextMeasure };
     ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&data, sizeof(data));
 }
 
@@ -43,13 +44,22 @@ uint32_t secondsUntilMorning(uint32_t utcEpoch) {
     return (uint32_t)(86400 - secsToday + target);
 }
 
+// Returns seconds until the next measurement: intervalSecs minus time elapsed since the last full hour.
+// Example: 13:11 with 3h interval -> 10800 - 660 = 10140s -> wakes at 16:00.
+uint32_t secondsUntilNextMeasure(uint32_t intervalSecs) {
+    time_t now = time(nullptr);
+    struct tm local;
+    localtime_r(&now, &local);
+    uint32_t secsFromLastHour = (uint32_t)(local.tm_min * 60 + local.tm_sec);
+    return intervalSecs - secsFromLastHour;
+}
+
 // ADS1115 analog-to-digital converter
 Adafruit_ADS1115 ads;
 
 void Sleep(uint32_t secondsToSleep)
 {
-	uint32_t maxSecs = (uint32_t)(ESP.deepSleepMax() / 1000000ULL);
-	uint32_t toSleep = secondsToSleep < maxSecs ? secondsToSleep : maxSecs;
+	uint32_t toSleep = secondsToSleep < MAX_SLEEP_SECS ? secondsToSleep : MAX_SLEEP_SECS;
 
 	WiFi.disconnect(true);
 	WiFi.mode(WIFI_OFF);
@@ -386,19 +396,29 @@ void setup()
 	Serial.println();
 	Serial.println("Starting...");
 
-	// Early night check from RTC memory - only valid after a deep sleep wake-up.
-	// On manual reset the RTC epoch is stale and must not be used for time decisions.
+	// RTC checks are only valid after a deep sleep wake-up; on manual reset the data is stale.
 	RtcData rtc;
-	if (!doCalibration
-	    && ESP.getResetReason() == "Deep-Sleep Wake"
-	    && loadRtcData(rtc)
-	    && isNightTime(rtc.utcEpoch)) {
-		uint32_t maxSecs = (uint32_t)(ESP.deepSleepMax() / 1000000ULL);
+	bool validWake = !doCalibration
+	                 && ESP.getResetReason() == "Deep-Sleep Wake"
+	                 && loadRtcData(rtc);
+
+	if (validWake && isNightTime(rtc.utcEpoch)) {
 		uint32_t toSleep = secondsUntilMorning(rtc.utcEpoch);
-		if (toSleep > maxSecs) toSleep = maxSecs;
+		if (toSleep > MAX_SLEEP_SECS) toSleep = MAX_SLEEP_SECS;
 		Serial.printf("Night time (%02dh local) - sleeping %us\n",
 		              (int)(((rtc.utcEpoch + 3600UL) / 3600UL) % 24UL), toSleep);
-		saveRtcData(rtc.utcEpoch + toSleep);
+		saveRtcData(rtc.utcEpoch + toSleep, rtc.nextMeasure);
+		delay(100);
+		ESP.deepSleep((uint64_t)toSleep * uS_TO_S_FACTOR);
+		return;
+	}
+
+	if (validWake && rtc.utcEpoch < rtc.nextMeasure) {
+		uint32_t toSleep = rtc.nextMeasure - rtc.utcEpoch;
+		if (toSleep > MAX_SLEEP_SECS) toSleep = MAX_SLEEP_SECS;
+		Serial.printf("Intermediate wake - next measure in %us, sleeping %us\n",
+		              rtc.nextMeasure - rtc.utcEpoch, toSleep);
+		saveRtcData(rtc.utcEpoch + toSleep, rtc.nextMeasure);
 		delay(100);
 		ESP.deepSleep((uint64_t)toSleep * uS_TO_S_FACTOR);
 		return;
@@ -439,8 +459,11 @@ void setup()
 
 	digitalWrite(D5, LOW);
 
-	uint32_t sleepSecs = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
-	saveRtcData((uint32_t)time(nullptr) + sleepSecs);
+	uint32_t intervalSecs    = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
+	uint32_t sleepSecs       = secondsUntilNextMeasure(intervalSecs);
+	uint32_t cappedSleep     = sleepSecs < MAX_SLEEP_SECS ? sleepSecs : MAX_SLEEP_SECS;
+	uint32_t nextMeasureEpoch = (uint32_t)time(nullptr) + sleepSecs;
+	saveRtcData((uint32_t)time(nullptr) + cappedSleep, nextMeasureEpoch);
 	Sleep(sleepSecs);
 }
 
