@@ -447,11 +447,33 @@ void setup()
 		return;
 	}
 
+	Serial.printf("Configuring NTP: server=%s tz=%s\n", MY_NTP_SERVER, MY_TZ);
 	configTime(MY_TZ, MY_NTP_SERVER);
 
-	// Wait for NTP sync (max 10s)
-	time_t now = 0;
-	for (int i = 0; i < 20 && now < 1000000; i++) { delay(500); time(&now); }
+	// Wait for NTP sync; retry up to NTP_RETRIES times with NTP_WAIT_MS between polls.
+	// Each retry calls configTime again to re-trigger the SNTP request.
+	bool ntpOk = false;
+	for (int attempt = 1; attempt <= NTP_RETRIES && !ntpOk; attempt++) {
+		if (attempt > 1) {
+			Serial.printf("NTP attempt %d/%d - re-requesting from %s\n", attempt, NTP_RETRIES, MY_NTP_SERVER);
+			configTime(MY_TZ, MY_NTP_SERVER);
+		}
+		time_t now = 0;
+		for (int i = 0; i < NTP_POLLS_PER_ATTEMPT && now < 1000000000; i++) {
+			delay(NTP_WAIT_MS);
+			time(&now);
+			Serial.printf("  NTP poll %d: epoch=%lu\n", i + 1, (unsigned long)now);
+		}
+		time_t final = time(nullptr);
+		if (final >= 1000000000) {
+			ntpOk = true;
+			Serial.printf("NTP synced on attempt %d: epoch=%lu (%s)\n",
+			              attempt, (unsigned long)final, GetZuluTime().c_str());
+		} else {
+			Serial.printf("NTP attempt %d failed (epoch=%lu)\n", attempt, (unsigned long)final);
+		}
+	}
+	if (!ntpOk) Serial.println("NTP sync failed - using fixed interval sleep.");
 
 	Serial.println("Initialized.");
 	Serial.println();
@@ -460,10 +482,17 @@ void setup()
 
 	digitalWrite(D5, LOW);
 
-	uint32_t intervalSecs    = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
-	uint32_t sleepSecs       = secondsUntilNextMeasure(intervalSecs);
-	uint32_t cappedSleep     = sleepSecs < MAX_SLEEP_SECS ? sleepSecs : MAX_SLEEP_SECS;
-	uint32_t nextMeasureEpoch = (uint32_t)time(nullptr) + sleepSecs;
+	uint32_t intervalSecs = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
+	uint32_t sleepSecs, cappedSleep, nextMeasureEpoch;
+	if (ntpOk) {
+		sleepSecs        = secondsUntilNextMeasure(intervalSecs);
+		cappedSleep      = sleepSecs < MAX_SLEEP_SECS ? sleepSecs : MAX_SLEEP_SECS;
+		nextMeasureEpoch = (uint32_t)time(nullptr) + sleepSecs;
+	} else {
+		sleepSecs        = intervalSecs;
+		cappedSleep      = sleepSecs < MAX_SLEEP_SECS ? sleepSecs : MAX_SLEEP_SECS;
+		nextMeasureEpoch = 0; // invalid epoch; force measurement on next wake
+	}
 	saveRtcData((uint32_t)time(nullptr) + cappedSleep, nextMeasureEpoch);
 	Sleep(sleepSecs);
 }
