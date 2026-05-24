@@ -5,6 +5,7 @@
 #include <Adafruit_ADS1X15.h>
 
 #define uS_TO_S_FACTOR 1000000ULL // microseconds per second
+#define MAX_SLEEP_SECS 3600       // ESP8266 hardware cap; do not raise above ~3600 s
 
 // RTC user memory survives deep sleep and is used to estimate the current time
 // without a WiFi/NTP round-trip on every wake-up.
