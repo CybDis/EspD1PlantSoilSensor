@@ -13,13 +13,22 @@
 
 // RTC user memory survives deep sleep and is used to estimate the current time
 // without a WiFi/NTP round-trip on every wake-up.
-#define RTC_MAGIC  0xA5C3F1E9  // increment when RtcData layout changes
+// On ESP8266 boards where GPIO16 is wired to RST for deep-sleep wake, a physical RESET
+// and a timer wake both pull RST low — the chip cannot tell them apart, so getResetReason()
+// always returns "Deep-Sleep Wake" for both. We use a pendingWake flag instead:
+// set it to 1 just before deepSleep(), clear it as the very first thing in setup().
+// That way a RESET while the CPU is awake (pendingWake already 0) is always treated as a
+// fresh boot. A RESET while sleeping (pendingWake still 1) is indistinguishable at hardware
+// level and treated the same as a timer wake — unavoidable limitation of this platform.
+#define RTC_MAGIC  0xA5C3F1EB  // increment when RtcData layout changes
 #define RTC_OFFSET 0  // word offset in the user RTC area
+#define RTC_WAKE_TOKEN 1
 
 struct RtcData {
     uint32_t magic;
     uint32_t utcEpoch;    // estimated UTC time at the next scheduled wake-up
     uint32_t nextMeasure; // UTC time of the next scheduled measurement
+    uint32_t pendingWake; // RTC_WAKE_TOKEN when a timer wake is pending; cleared at boot
 };
 
 bool loadRtcData(RtcData &data) {
@@ -28,7 +37,7 @@ bool loadRtcData(RtcData &data) {
 }
 
 void saveRtcData(uint32_t utcEpoch, uint32_t nextMeasure) {
-    RtcData data = { RTC_MAGIC, utcEpoch, nextMeasure };
+    RtcData data = { RTC_MAGIC, utcEpoch, nextMeasure, RTC_WAKE_TOKEN };
     ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&data, sizeof(data));
 }
 
@@ -401,20 +410,23 @@ void setup()
 	Serial.println();
 	Serial.printf("Starting... (reset reason: %s)\n", ESP.getResetReason().c_str());
 
-	// validWake requires: deep-sleep wake reason, valid RTC magic, and a plausible epoch.
-	// The epoch check rejects data written after an NTP failure (~epoch 0) and guards against
-	// boards where an RTS reset mis-reports as "Deep-Sleep Wake".
+	// Read RTC data and immediately clear pendingWake so that any reset WHILE AWAKE is
+	// seen as a fresh boot on the next run. wasTimerWake captures the flag before clearing.
 	RtcData rtc;
 	bool rtcValid = loadRtcData(rtc);
-	bool validWake = !doCalibration
-	                 && ESP.getResetReason() == "Deep-Sleep Wake"
-	                 && rtcValid
-	                 && rtc.utcEpoch >= MIN_VALID_UTC;
+	bool wasTimerWake = rtcValid && rtc.pendingWake == RTC_WAKE_TOKEN;
+	if (rtcValid) {
+		rtc.pendingWake = 0;
+		ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&rtc, sizeof(rtc));
+	}
 
-	Serial.printf("RTC: magic=%s epoch=%lu nextMeasure=%lu -> validWake=%d\n",
+	bool validWake = !doCalibration && wasTimerWake && rtc.utcEpoch >= MIN_VALID_UTC;
+
+	Serial.printf("RTC: magic=%s epoch=%lu nextMeasure=%lu pendingWake=%lu -> validWake=%d\n",
 	              rtcValid ? "ok" : "bad",
 	              rtcValid ? (unsigned long)rtc.utcEpoch : 0UL,
 	              rtcValid ? (unsigned long)rtc.nextMeasure : 0UL,
+	              rtcValid ? (unsigned long)rtc.pendingWake : 0UL,
 	              validWake);
 
 	if (validWake && isNightTime(rtc.utcEpoch)) {
