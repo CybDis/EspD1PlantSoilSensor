@@ -480,12 +480,16 @@ void setup()
 
 	// Calibration mode runs without WiFi/NTP: just power the sensors and stream readings.
 	if (doCalibration) {
+		Serial.print("Starting ADS via D5... ");
 		pinMode(D5, OUTPUT);
 		digitalWrite(D5, HIGH);
-		delay(2000); // required for ADS to come up
+		Serial.println("Waiting (10s) for ADS to come up... ");
+		delay(10000); // required for ADS to come up
 		ads.setGain(GAIN_ONE); // set to +- 4096 mV
 		bool adsOk = ads.begin();
-		if (!adsOk)
+		if (adsOk)
+			Serial.println("Initialized.");
+		else
 			Serial.println("Error initializing ADS!");
 		updateSensor(0, adsOk);
 		deepSleepSeconds(TIME_TO_SLEEP);
