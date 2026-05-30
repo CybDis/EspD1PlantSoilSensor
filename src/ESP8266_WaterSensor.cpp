@@ -479,14 +479,17 @@ void setup()
 		Serial.println("Double reset detected - forcing measurement.");
 
 	// Calibration mode runs without WiFi/NTP: just power the sensors and stream readings.
-	if (doCalibration) {
+	if (doCalibration) 
+	{
+		Serial.print("Initializing ADS ... ");
 		pinMode(D5, OUTPUT);
 		digitalWrite(D5, HIGH);
-		delay(2000); // required for ADS to come up
 		ads.setGain(GAIN_ONE); // set to +- 4096 mV
 		delay(2000); // required for ADS to come up
 		bool adsOk = ads.begin();
-		if (!adsOk)
+		if (adsOk)
+			Serial.println("Initialized.");
+		else
 			Serial.println("Error initializing ADS!");
 		updateSensor(0, adsOk);
 		deepSleepSeconds(TIME_TO_SLEEP);
@@ -539,21 +542,18 @@ void setup()
 	}
 
 	// 4. Time to measure: power the sensors, read them and publish via MQTT.
+	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");	
 	Serial.print("Starting ADS via D5... ");
 	pinMode(D5, OUTPUT);
 	digitalWrite(D5, HIGH);
-	Serial.println("Waiting (10s) for ADS to come up... ");
-	delay(5000); // required for ADS to come up
 	ads.setGain(GAIN_ONE); // set to +- 4096 mV
-	delay(5000); // required for ADS to come up
-	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");	
-	Serial.println("Initializing ADS ... ");
+	delay(2000); // required for ADS to come up
+	Serial.print("Initializing ADS ... ");
 	bool adsOk = ads.begin();
 	if (adsOk)
 		Serial.println("Initialized.");
 	else
 		Serial.println("Error initializing ADS!");
-	Serial.println();
 
 	// Estimate next measure before reading (uses TIME_TO_SLEEP; accurate when battery > 80%)
 	uint32_t nextMeasureEst = 0;
@@ -566,7 +566,7 @@ void setup()
 	}
 	int battPercent = updateSensor(nextMeasureEst, adsOk);
 	digitalWrite(D5, LOW);
-	
+
 	// Schedule the next measurement. The interval depends on the battery level we just read.
 	uint32_t intervalSecs = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
 	uint32_t toSleep;
