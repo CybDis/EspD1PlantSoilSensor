@@ -482,8 +482,8 @@ void setup()
 	if (doCalibration) {
 		pinMode(D5, OUTPUT);
 		digitalWrite(D5, HIGH);
-		delay(2000); // required for ADS to come up
 		ads.setGain(GAIN_ONE); // set to +- 4096 mV
+		delay(2000); // required for ADS to come up
 		bool adsOk = ads.begin();
 		if (!adsOk)
 			Serial.println("Error initializing ADS!");
@@ -542,16 +542,10 @@ void setup()
 	pinMode(D5, OUTPUT);
 	digitalWrite(D5, HIGH);
 	Serial.println("Waiting (10s) for ADS to come up... ");
+	ads.setGain(GAIN_ONE); // set to +- 4096 mV
 	delay(10000); // required for ADS to come up
-	ads.setGain(GAIN_ONE); // set to +- 4096 mV
-		bool adsOk = ads.begin();
-		updateSensor(0, adsOk);
-
-	pinMode(D5, OUTPUT);
-	digitalWrite(D5, HIGH);
-	delay(2000); // required for ADS to come up
-	ads.setGain(GAIN_ONE); // set to +- 4096 mV
 	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");	
+	Serial.println("Initializing ADS ... ");
 	bool adsOk = ads.begin();
 	if (adsOk)
 		Serial.println("Initialized.");
