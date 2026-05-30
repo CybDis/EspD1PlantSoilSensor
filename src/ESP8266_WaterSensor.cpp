@@ -6,64 +6,62 @@
 
 #define uS_TO_S_FACTOR 1000000ULL // microseconds per second
 #define MAX_SLEEP_SECS        3600 // ESP8266 hardware cap; do not raise above ~3600 s
-#define MIN_VALID_UTC 1600000000UL // 2020-09-13; rejects NTP-fail epochs (~0) and bogus RTC data
+#define NTP_MIN_VALID_EPOCH 1000000000UL // 2001-09-09; a real NTP sync produces a value above this
 #define NTP_RETRIES              3 // full NTP attempts before giving up
 #define NTP_POLLS_PER_ATTEMPT   10 // polls per attempt
 #define NTP_WAIT_MS            500 // ms between polls
 
-// RTC user memory survives deep sleep and is used to estimate the current time
-// without a WiFi/NTP round-trip on every wake-up.
-// On ESP8266 boards where GPIO16 is wired to RST for deep-sleep wake, a physical RESET
-// and a timer wake both pull RST low — the chip cannot tell them apart, so getResetReason()
-// always returns "Deep-Sleep Wake" for both. We use a pendingWake flag instead:
-// set it to 1 just before deepSleep(), clear it as the very first thing in setup().
-// That way a RESET while the CPU is awake (pendingWake already 0) is always treated as a
-// fresh boot. A RESET while sleeping (pendingWake still 1) is indistinguishable at hardware
-// level and treated the same as a timer wake — unavoidable limitation of this platform.
-#define RTC_MAGIC  0xA5C3F1EB  // increment when RtcData layout changes
-#define RTC_OFFSET 0  // word offset in the user RTC area
-#define RTC_WAKE_TOKEN 1
+// We deliberately do NOT estimate time across deep sleep. The board has no real-time clock,
+// and dead-reckoning the epoch from sleep durations proved unreliable. Instead, on every wake
+// the device fetches the real UTC time via NTP first and decides everything from that.
+// The only value kept in RTC user memory is the scheduled epoch of the next measurement, and
+// it is always compared against the freshly fetched real time, never used as a clock itself.
+#define RTC_MAGIC  0xA5C3F1ED  // increment when RtcData layout changes
+#define RTC_OFFSET 0           // word offset in the user RTC area
+#define DRD_ARMED  0xBEEFCAFEUL // double-reset-detector sentinel; see setup()
 
 struct RtcData {
     uint32_t magic;
-    uint32_t utcEpoch;    // estimated UTC time at the next scheduled wake-up
-    uint32_t nextMeasure; // UTC time of the next scheduled measurement
-    uint32_t pendingWake; // RTC_WAKE_TOKEN when a timer wake is pending; cleared at boot
+    uint32_t nextMeasure; // real UTC epoch of the next scheduled measurement
+    uint32_t drd;         // DRD_ARMED while a wake cycle is in progress; see double-reset logic
 };
 
-bool loadRtcData(RtcData &data) {
-    ESP.rtcUserMemoryRead(RTC_OFFSET, (uint32_t *)&data, sizeof(data));
-    return data.magic == RTC_MAGIC;
+// In-memory copy of the RTC user-memory block, persisted via rtcPersist().
+RtcData g_rtc;
+bool    g_rtcValid = false;
+
+void rtcLoad() {
+    ESP.rtcUserMemoryRead(RTC_OFFSET, (uint32_t *)&g_rtc, sizeof(g_rtc));
+    g_rtcValid = (g_rtc.magic == RTC_MAGIC);
+    if (!g_rtcValid) {
+        g_rtc.nextMeasure = 0;
+        g_rtc.drd = 0;
+    }
 }
 
-void saveRtcData(uint32_t utcEpoch, uint32_t nextMeasure) {
-    RtcData data = { RTC_MAGIC, utcEpoch, nextMeasure, RTC_WAKE_TOKEN };
-    ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&data, sizeof(data));
+void rtcPersist() {
+    g_rtc.magic = RTC_MAGIC;
+    ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&g_rtc, sizeof(g_rtc));
 }
 
-// UTC+1 (CET) as a conservative Berlin estimate; at most 1 hour early during summer time
-bool isNightTime(uint32_t utcEpoch) {
-    int hour = (int)(((utcEpoch + 3600UL) / 3600UL) % 24UL);
-    return hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR;
+// All checks below run on the real local time from NTP + MY_TZ, so they are
+// daylight-saving correct.
+bool isNightTime(const struct tm &local) {
+    return local.tm_hour >= NIGHT_START_HOUR || local.tm_hour < NIGHT_END_HOUR;
 }
 
-uint32_t secondsUntilMorning(uint32_t utcEpoch) {
-    uint32_t local    = utcEpoch + 3600UL;
-    int secsToday     = (int)((local / 3600UL % 24UL) * 3600UL
-                            + (local / 60UL  % 60UL) * 60UL
-                            +  local % 60UL);
-    int target        = NIGHT_END_HOUR * 3600;
+uint32_t secondsUntilMorning(const struct tm &local) {
+    int secsToday = local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec;
+    int target    = NIGHT_END_HOUR * 3600;
     if (secsToday < target)
         return (uint32_t)(target - secsToday);
     return (uint32_t)(86400 - secsToday + target);
 }
 
-// Returns seconds until the next measurement: intervalSecs minus time elapsed since the last full hour.
-// Example: 13:11 with 3h interval -> 10800 - 660 = 10140s -> wakes at 16:00.
-uint32_t secondsUntilNextMeasure(uint32_t intervalSecs) {
-    time_t now = time(nullptr);
-    struct tm local;
-    localtime_r(&now, &local);
+// Seconds until the next measurement, aligned to the top of the hour:
+// intervalSecs minus the time already elapsed since the last full hour.
+// Example: 13:11 with a 3h interval -> 10800 - 660 = 10140s -> next measure at 16:00.
+uint32_t secondsUntilNextMeasure(const struct tm &local, uint32_t intervalSecs) {
     uint32_t secsFromLastHour = (uint32_t)(local.tm_min * 60 + local.tm_sec);
     return intervalSecs - secsFromLastHour;
 }
@@ -71,9 +69,17 @@ uint32_t secondsUntilNextMeasure(uint32_t intervalSecs) {
 // ADS1115 analog-to-digital converter
 Adafruit_ADS1115 ads;
 
-void Sleep(uint32_t secondsToSleep)
+void deepSleepSeconds(uint32_t secondsToSleep)
 {
+	// Cap to the hardware limit. Longer waits (night, multi-hour intervals) are handled by
+	// re-checking the real time on the next wake, so a capped sleep is always safe.
 	uint32_t toSleep = secondsToSleep < MAX_SLEEP_SECS ? secondsToSleep : MAX_SLEEP_SECS;
+
+	// Disarm the double-reset detector: a normal timer wake must not look like a manual
+	// double reset. If a second reset arrives before we reach this point, the flag is still
+	// armed on the next boot and a measurement is forced.
+	g_rtc.drd = 0;
+	rtcPersist();
 
 	WiFi.disconnect(true);
 	WiFi.mode(WIFI_OFF);
@@ -117,6 +123,16 @@ const bool connectToNetwork()
 	Serial.println(WiFi.localIP());
 
 	return WiFi.status() == WL_CONNECTED;
+}
+
+String EpochToZuluTime(uint32_t epoch)
+{
+	time_t t = (time_t)epoch;
+	struct tm tm;
+	gmtime_r(&t, &tm);
+	char buf[25];
+	snprintf(buf, sizeof(buf), "20%02d-%02d-%02dT%02d:%02d:%02dZ", tm.tm_year - 100, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+	return String(buf);
 }
 
 const String GetZuluTime()
@@ -169,7 +185,7 @@ String floatToString(float value, int decimalPlaces)
 	}
 }
 
-void SenqMqtt(float battVolt, float battPercent, float percent1, float percent2, float percent3, float percent4)
+void SenqMqtt(float battVolt, float battPercent, float percent1, float percent2, float percent3, float percent4, uint32_t nextMeasure)
 {
 	byte mac[WL_MAC_ADDR_LENGTH];
 	WiFi.macAddress(mac);
@@ -191,6 +207,7 @@ void SenqMqtt(float battVolt, float battPercent, float percent1, float percent2,
 	HASensor sensorSoil2(concat("soil2_", device.getUniqueId()));
 	HASensor sensorSoil3(concat("soil3_", device.getUniqueId()));
 	HASensor sensorSoil4(concat("soil4_", device.getUniqueId()));
+	HASensor sensorNextUpdate(concat("nextUpdate_", device.getUniqueId()));
 
 	// For Icons, see https://pictogrammers.github.io/@mdi/font/7.1.96/
 
@@ -247,6 +264,12 @@ void SenqMqtt(float battVolt, float battPercent, float percent1, float percent2,
 	sensorTimestamp.setDeviceClass("timestamp");
 	sensorTimestamp.setExpireAfter(43200);
 
+	sensorNextUpdate.setName(concat(deviceName, " Next Update"));
+	sensorNextUpdate.setIcon("mdi:calendar-clock");
+	sensorNextUpdate.setDeviceClass("timestamp");
+	sensorNextUpdate.setForceUpdate(true);
+	sensorNextUpdate.setExpireAfter(43200);
+
 	String dateTime = GetZuluTime();
 	Serial.print("Datetime: ");
 	Serial.println(dateTime);
@@ -270,6 +293,7 @@ void SenqMqtt(float battVolt, float battPercent, float percent1, float percent2,
 		sensorBatteryVoltage.setValue(floatToString(battVolt, 2).c_str());
 		sensorBatteryPercent.setValue(floatToString(battPercent, 1).c_str());
 		sensorTimestamp.setValue(dateTime.c_str());
+		sensorNextUpdate.setValue(EpochToZuluTime(nextMeasure).c_str());
 
 		for (int i = 0;i<10;i++) {
 			mqtt.loop(); // processes messages multiple times, dunno why required - strange impl
@@ -336,7 +360,7 @@ void WriteCalibrationData(int port, float value, float min, float max, int air, 
 	Serial.println();
 }
 
-int updateSensor()
+int updateSensor(uint32_t nextMeasure)
 {
 	float min0 = 55555, min1 = 55555, min2 = 55555, min3 = 55555;
 	float max0 = -1, max1 = -1, max2 = -1, max3 = -1;
@@ -399,9 +423,37 @@ int updateSensor()
 	Serial.println(battPercent);
 	Serial.println();
 
-	SenqMqtt(volt, battPercent, percent0, percent1, percent2, percent3);
+	SenqMqtt(volt, battPercent, percent0, percent1, percent2, percent3, nextMeasure);
 
 	return battPercent;
+}
+
+// Fetch the real UTC time via NTP. Returns true once a plausible epoch is received.
+bool syncTime()
+{
+	Serial.printf("Configuring NTP: server=%s tz=%s\n", MY_NTP_SERVER, MY_TZ);
+	configTime(MY_TZ, MY_NTP_SERVER);
+
+	for (int attempt = 1; attempt <= NTP_RETRIES; attempt++) {
+		if (attempt > 1) {
+			Serial.printf("NTP attempt %d/%d - re-requesting from %s\n", attempt, NTP_RETRIES, MY_NTP_SERVER);
+			configTime(MY_TZ, MY_NTP_SERVER);
+		}
+		time_t now = 0;
+		for (int i = 0; i < NTP_POLLS_PER_ATTEMPT && now < NTP_MIN_VALID_EPOCH; i++) {
+			delay(NTP_WAIT_MS);
+			time(&now);
+			Serial.printf("  NTP poll %d: epoch=%lu\n", i + 1, (unsigned long)now);
+		}
+		if (now >= NTP_MIN_VALID_EPOCH) {
+			Serial.printf("NTP synced on attempt %d: epoch=%lu (%s)\n",
+			              attempt, (unsigned long)now, GetZuluTime().c_str());
+			return true;
+		}
+		Serial.printf("NTP attempt %d failed (epoch=%lu)\n", attempt, (unsigned long)now);
+	}
+	Serial.println("NTP sync failed.");
+	return false;
 }
 
 void setup()
@@ -410,117 +462,122 @@ void setup()
 	Serial.println();
 	Serial.printf("Starting... (reset reason: %s)\n", ESP.getResetReason().c_str());
 
-	// Read RTC data and immediately clear pendingWake so that any reset WHILE AWAKE is
-	// seen as a fresh boot on the next run. wasTimerWake captures the flag before clearing.
-	RtcData rtc;
-	bool rtcValid = loadRtcData(rtc);
-	bool wasTimerWake = rtcValid && rtc.pendingWake == RTC_WAKE_TOKEN;
-	if (rtcValid) {
-		rtc.pendingWake = 0;
-		ESP.rtcUserMemoryWrite(RTC_OFFSET, (uint32_t *)&rtc, sizeof(rtc));
-	}
+	rtcLoad();
 
-	bool validWake = !doCalibration && wasTimerWake && rtc.utcEpoch >= MIN_VALID_UTC;
+	// Double-reset detector: pressing RESET twice within one wake cycle forces an immediate
+	// measurement, even during night time or before the interval is due. The flag is armed
+	// here and disarmed in deepSleepSeconds(). If a second reset arrives before the device
+	// sleeps, the flag is still armed on this boot and we force a measurement.
+	bool forceMeasure = g_rtcValid && g_rtc.drd == DRD_ARMED;
+	g_rtc.drd = DRD_ARMED;
+	rtcPersist();
+	if (forceMeasure)
+		Serial.println("Double reset detected - forcing measurement.");
 
-	Serial.printf("RTC: magic=%s epoch=%lu nextMeasure=%lu pendingWake=%lu -> validWake=%d\n",
-	              rtcValid ? "ok" : "bad",
-	              rtcValid ? (unsigned long)rtc.utcEpoch : 0UL,
-	              rtcValid ? (unsigned long)rtc.nextMeasure : 0UL,
-	              rtcValid ? (unsigned long)rtc.pendingWake : 0UL,
-	              validWake);
-
-	if (validWake && isNightTime(rtc.utcEpoch)) {
-		uint32_t toSleep = secondsUntilMorning(rtc.utcEpoch);
-		if (toSleep > MAX_SLEEP_SECS) toSleep = MAX_SLEEP_SECS;
-		Serial.printf("Night time (%02dh local) - sleeping %us\n",
-		              (int)(((rtc.utcEpoch + 3600UL) / 3600UL) % 24UL), toSleep);
-		saveRtcData(rtc.utcEpoch + toSleep, rtc.nextMeasure);
-		delay(100);
-		ESP.deepSleep((uint64_t)toSleep * uS_TO_S_FACTOR);
+	// Calibration mode runs without WiFi/NTP: just power the sensors and stream readings.
+	if (doCalibration) {
+		pinMode(D5, OUTPUT);
+		digitalWrite(D5, HIGH);
+		delay(2000); // required for ADS to come up
+		ads.setGain(GAIN_ONE); // set to +- 4096 mV
+		if (!ads.begin())
+			Serial.println("Error initializing ADS!");
+		else
+			updateSensor(0);
+		deepSleepSeconds(TIME_TO_SLEEP);
 		return;
 	}
 
-	if (validWake && rtc.utcEpoch < rtc.nextMeasure) {
-		uint32_t toSleep = rtc.nextMeasure - rtc.utcEpoch;
-		if (toSleep > MAX_SLEEP_SECS) toSleep = MAX_SLEEP_SECS;
-		Serial.printf("Intermediate wake - next measure in %us, sleeping %us\n",
-		              rtc.nextMeasure - rtc.utcEpoch, toSleep);
-		saveRtcData(rtc.utcEpoch + toSleep, rtc.nextMeasure);
-		delay(100);
-		ESP.deepSleep((uint64_t)toSleep * uS_TO_S_FACTOR);
-		return;
+	// 1. Bring up WiFi as early as possible. Without WiFi we cannot reach the MQTT broker,
+	//    so retry on the next wake.
+	if (!connectToNetwork()) {
+		Serial.println("WiFi failed, retrying once...");
+		WiFi.disconnect(true);
+		delay(1000);
+		if (!connectToNetwork()) {
+			Serial.println("Error connecting to WiFi - sleeping.");
+			deepSleepSeconds(TIME_TO_SLEEP);
+			return;
+		}
 	}
 
-	// ADS and SOIL sensors powered via D5
+	// 2. Fetch the real UTC time. If NTP fails (internet disturbed but local broker still
+	//    reachable), we deliberately skip the night/interval gating below and measure anyway,
+	//    so the device keeps sending instead of going silent.
+	bool haveTime = syncTime();
+
+	time_t now = time(nullptr);
+	struct tm local;
+	// A forced measurement (double reset) skips both the night and the interval gate.
+	if (haveTime && !forceMeasure) {
+		localtime_r(&now, &local);
+		Serial.printf("Real local time: %02d:%02d:%02d\n", local.tm_hour, local.tm_min, local.tm_sec);
+
+		// 3a. Night time: go back to sleep as quickly as possible. The sleep is capped to the
+		//     hardware limit and re-checked against fresh NTP time on the next wake.
+		if (isNightTime(local)) {
+			uint32_t toSleep = secondsUntilMorning(local);
+			Serial.printf("Night time (%02dh local) - sleeping up to %us\n", local.tm_hour, toSleep);
+			deepSleepSeconds(toSleep);
+			return;
+		}
+
+		// 3b. Not yet due for the next measurement: sleep until it is (capped, re-checked next wake).
+		if ((uint32_t)now < g_rtc.nextMeasure) {
+			uint32_t toSleep = g_rtc.nextMeasure - (uint32_t)now;
+			Serial.printf("Next measurement in %us - sleeping.\n", toSleep);
+			deepSleepSeconds(toSleep);
+			return;
+		}
+	} else if (!haveTime) {
+		Serial.println("No time available - measuring and sending anyway.");
+	}
+
+	// 4. Time to measure: power the sensors, read them and publish via MQTT.
 	pinMode(D5, OUTPUT);
 	digitalWrite(D5, HIGH);
 
-	if (!doCalibration && !connectToNetwork())
-	{
-		Serial.print("Error connecting to wifi!");
-		Sleep(TIME_TO_SLEEP);
-		return;
-	}
-	else if (doCalibration)
-		delay(2000); // required for ADS to come up
-
 	ads.setGain(GAIN_ONE); // set to +- 4096 mV
 	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");
-	if (!ads.begin())
-	{
-		Serial.print("Error initializing ADS!");
-		Sleep(TIME_TO_SLEEP);
+	if (!ads.begin()) {
+		Serial.println("Error initializing ADS!");
+		deepSleepSeconds(TIME_TO_SLEEP);
 		return;
 	}
-
-	Serial.printf("Configuring NTP: server=%s tz=%s\n", MY_NTP_SERVER, MY_TZ);
-	configTime(MY_TZ, MY_NTP_SERVER);
-
-	// Wait for NTP sync; retry up to NTP_RETRIES times with NTP_WAIT_MS between polls.
-	// Each retry calls configTime again to re-trigger the SNTP request.
-	bool ntpOk = false;
-	for (int attempt = 1; attempt <= NTP_RETRIES && !ntpOk; attempt++) {
-		if (attempt > 1) {
-			Serial.printf("NTP attempt %d/%d - re-requesting from %s\n", attempt, NTP_RETRIES, MY_NTP_SERVER);
-			configTime(MY_TZ, MY_NTP_SERVER);
-		}
-		time_t now = 0;
-		for (int i = 0; i < NTP_POLLS_PER_ATTEMPT && now < 1000000000; i++) {
-			delay(NTP_WAIT_MS);
-			time(&now);
-			Serial.printf("  NTP poll %d: epoch=%lu\n", i + 1, (unsigned long)now);
-		}
-		time_t final = time(nullptr);
-		if (final >= 1000000000) {
-			ntpOk = true;
-			Serial.printf("NTP synced on attempt %d: epoch=%lu (%s)\n",
-			              attempt, (unsigned long)final, GetZuluTime().c_str());
-		} else {
-			Serial.printf("NTP attempt %d failed (epoch=%lu)\n", attempt, (unsigned long)final);
-		}
-	}
-	if (!ntpOk) Serial.println("NTP sync failed - using fixed interval sleep.");
 
 	Serial.println("Initialized.");
 	Serial.println();
 
-	int battPercent = updateSensor();
+	// Estimate next measure before reading (uses TIME_TO_SLEEP; accurate when battery > 80%)
+	uint32_t nextMeasureEst = 0;
+	if (haveTime) {
+		time_t t = time(nullptr);
+		struct tm loc;
+		localtime_r(&t, &loc);
+		uint32_t secs = secondsUntilNextMeasure(loc, TIME_TO_SLEEP);
+		nextMeasureEst = (uint32_t)t + secs;
+	}
+	int battPercent = updateSensor(nextMeasureEst);
 
 	digitalWrite(D5, LOW);
 
+	// Schedule the next measurement. The interval depends on the battery level we just read.
 	uint32_t intervalSecs = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
-	uint32_t sleepSecs, cappedSleep, nextMeasureEpoch;
-	if (ntpOk) {
-		sleepSecs        = secondsUntilNextMeasure(intervalSecs);
-		cappedSleep      = sleepSecs < MAX_SLEEP_SECS ? sleepSecs : MAX_SLEEP_SECS;
-		nextMeasureEpoch = (uint32_t)time(nullptr) + sleepSecs;
+	uint32_t toSleep;
+	if (haveTime) {
+		// Align to the top of the hour. Re-read the real time so the schedule is accurate.
+		now = time(nullptr);
+		localtime_r(&now, &local);
+		toSleep = secondsUntilNextMeasure(local, intervalSecs);
+		g_rtc.nextMeasure = (uint32_t)now + toSleep;
 	} else {
-		sleepSecs        = intervalSecs;
-		cappedSleep      = sleepSecs < MAX_SLEEP_SECS ? sleepSecs : MAX_SLEEP_SECS;
-		nextMeasureEpoch = 0; // invalid epoch; force measurement on next wake
+		// No real time: sleep a fixed interval and retry NTP next wake. Store 0 so the
+		// interval gate never blocks a future wake based on a bogus timestamp.
+		toSleep = intervalSecs;
+		g_rtc.nextMeasure = 0;
 	}
-	saveRtcData((uint32_t)time(nullptr) + cappedSleep, nextMeasureEpoch);
-	Sleep(sleepSecs);
+	rtcPersist();
+	deepSleepSeconds(toSleep);
 }
 
 void loop()
