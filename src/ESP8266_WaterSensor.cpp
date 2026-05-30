@@ -360,51 +360,55 @@ void WriteCalibrationData(int port, float value, float min, float max, int air, 
 	Serial.println();
 }
 
-int updateSensor(uint32_t nextMeasure)
+int updateSensor(uint32_t nextMeasure, bool adsOk)
 {
-	float min0 = 55555, min1 = 55555, min2 = 55555, min3 = 55555;
-	float max0 = -1, max1 = -1, max2 = -1, max3 = -1;
 	float percent0, percent1, percent2, percent3;
 
-	float adc0, adc1, adc2, adc3;
+	if (adsOk) {
+		float min0 = 55555, min1 = 55555, min2 = 55555, min3 = 55555;
+		float max0 = -1, max1 = -1, max2 = -1, max3 = -1;
+		float adc0, adc1, adc2, adc3;
 
-	int i = doCalibration ? 1000 : 1; // change to do calibration
-	while (i-- > 0)
-	{
-		adc0 = ads.readADC_SingleEnded(0) * 0.125;
-		if (adc0 > max0) max0 = adc0;
-		if (adc0 < min0) min0 = adc0;
-
-		adc1 = ads.readADC_SingleEnded(1) * 0.125;
-		if (adc1 > max1) max1 = adc1;
-		if (adc1 < min1) min1 = adc1;
-
-		adc2 = ads.readADC_SingleEnded(2) * 0.125;
-		if (adc2 > max2) max2 = adc2;
-		if (adc2 < min2) min2 = adc2;
-
-		adc3 = ads.readADC_SingleEnded(3) * 0.125;
-		if (adc3 > max3) max3 = adc3;
-		if (adc3 < min3) min3 = adc3;
-
-		WriteCalibrationData(0, adc0, min0, max0, air0, water0);
-		WriteCalibrationData(1, adc1, min1, max1, air1, water1);
-		WriteCalibrationData(2, adc2, min2, max2, air2, water2);
-		WriteCalibrationData(3, adc3, min3, max3, air3, water3);
-
-		if (i > 0)
+		int i = doCalibration ? 1000 : 1;
+		while (i-- > 0)
 		{
-			delay(500);
-			Serial.println();
-		}
-	}
-	if (doCalibration)
-		return 0;
+			adc0 = ads.readADC_SingleEnded(0) * 0.125;
+			if (adc0 > max0) max0 = adc0;
+			if (adc0 < min0) min0 = adc0;
 
-	percent0 = GetPercent(min0, air0, water0);
-	percent1 = GetPercent(min1, air1, water1);
-	percent2 = GetPercent(min2, air2, water2);
-	percent3 = GetPercent(min3, air3, water3);
+			adc1 = ads.readADC_SingleEnded(1) * 0.125;
+			if (adc1 > max1) max1 = adc1;
+			if (adc1 < min1) min1 = adc1;
+
+			adc2 = ads.readADC_SingleEnded(2) * 0.125;
+			if (adc2 > max2) max2 = adc2;
+			if (adc2 < min2) min2 = adc2;
+
+			adc3 = ads.readADC_SingleEnded(3) * 0.125;
+			if (adc3 > max3) max3 = adc3;
+			if (adc3 < min3) min3 = adc3;
+
+			WriteCalibrationData(0, adc0, min0, max0, air0, water0);
+			WriteCalibrationData(1, adc1, min1, max1, air1, water1);
+			WriteCalibrationData(2, adc2, min2, max2, air2, water2);
+			WriteCalibrationData(3, adc3, min3, max3, air3, water3);
+
+			if (i > 0)
+			{
+				delay(500);
+				Serial.println();
+			}
+		}
+		if (doCalibration)
+			return 0;
+
+		percent0 = GetPercent(min0, air0, water0);
+		percent1 = GetPercent(min1, air1, water1);
+		percent2 = GetPercent(min2, air2, water2);
+		percent3 = GetPercent(min3, air3, water3);
+	} else {
+		percent0 = percent1 = percent2 = percent3 = -1;
+	}
 	Serial.println();
 	
 	Serial.println("Reading Battery...");
@@ -480,10 +484,10 @@ void setup()
 		digitalWrite(D5, HIGH);
 		delay(2000); // required for ADS to come up
 		ads.setGain(GAIN_ONE); // set to +- 4096 mV
-		if (!ads.begin())
+		bool adsOk = ads.begin();
+		if (!adsOk)
 			Serial.println("Error initializing ADS!");
-		else
-			updateSensor(0);
+		updateSensor(0, adsOk);
 		deepSleepSeconds(TIME_TO_SLEEP);
 		return;
 	}
@@ -536,16 +540,15 @@ void setup()
 	// 4. Time to measure: power the sensors, read them and publish via MQTT.
 	pinMode(D5, OUTPUT);
 	digitalWrite(D5, HIGH);
+	delay(2000); // required for ADS to come up
 
 	ads.setGain(GAIN_ONE); // set to +- 4096 mV
 	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");
-	if (!ads.begin()) {
+	bool adsOk = ads.begin();
+	if (!adsOk)
 		Serial.println("Error initializing ADS!");
-		deepSleepSeconds(TIME_TO_SLEEP);
-		return;
-	}
-
-	Serial.println("Initialized.");
+	else
+		Serial.println("Initialized.");
 	Serial.println();
 
 	// Estimate next measure before reading (uses TIME_TO_SLEEP; accurate when battery > 80%)
@@ -557,7 +560,7 @@ void setup()
 		uint32_t secs = secondsUntilNextMeasure(loc, TIME_TO_SLEEP);
 		nextMeasureEst = (uint32_t)t + secs;
 	}
-	int battPercent = updateSensor(nextMeasureEst);
+	int battPercent = updateSensor(nextMeasureEst, adsOk);
 
 	digitalWrite(D5, LOW);
 
