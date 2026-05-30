@@ -482,6 +482,7 @@ void setup()
 	if (doCalibration) {
 		pinMode(D5, OUTPUT);
 		digitalWrite(D5, HIGH);
+		delay(2000); // required for ADS to come up
 		ads.setGain(GAIN_ONE); // set to +- 4096 mV
 		delay(2000); // required for ADS to come up
 		bool adsOk = ads.begin();
@@ -542,8 +543,9 @@ void setup()
 	pinMode(D5, OUTPUT);
 	digitalWrite(D5, HIGH);
 	Serial.println("Waiting (10s) for ADS to come up... ");
+	delay(5000); // required for ADS to come up
 	ads.setGain(GAIN_ONE); // set to +- 4096 mV
-	delay(10000); // required for ADS to come up
+	delay(5000); // required for ADS to come up
 	Serial.println("AnalogDigitalSensor: ADC Range set to: +/- 4096 mV (ADS1115: 1 bit = 0.125 mV)");	
 	Serial.println("Initializing ADS ... ");
 	bool adsOk = ads.begin();
@@ -552,7 +554,6 @@ void setup()
 	else
 		Serial.println("Error initializing ADS!");
 	Serial.println();
-	digitalWrite(D5, LOW);
 
 	// Estimate next measure before reading (uses TIME_TO_SLEEP; accurate when battery > 80%)
 	uint32_t nextMeasureEst = 0;
@@ -564,7 +565,8 @@ void setup()
 		nextMeasureEst = (uint32_t)t + secs;
 	}
 	int battPercent = updateSensor(nextMeasureEst, adsOk);
-
+	digitalWrite(D5, LOW);
+	
 	// Schedule the next measurement. The interval depends on the battery level we just read.
 	uint32_t intervalSecs = (battPercent > 80) ? TIME_TO_SLEEP : TIME_TO_SLEEP_LONG;
 	uint32_t toSleep;
